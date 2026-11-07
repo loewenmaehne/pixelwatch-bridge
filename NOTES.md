@@ -48,15 +48,35 @@ the script), and an SDP record plus RFCOMM server for the Wear OS service.
   act as RFCOMM client (IOBluetooth `openRFCOMMChannel`); the relay can pass
   bytes through without understanding them.
 
-## Next
+## Stage 3: Mac helper and relay (2026-11-07)
 
-1. When the watch is here: find its BR/EDR address from the Mac (CoreBluetooth
-   hides addresses; try IOBluetooth inquiry, the setup screen name, or the
-   advertisement), pair with it via IOBluetooth and read its SDP records.
-2. Mac helper: open RFCOMM to the watch's Wear OS service and expose it on a
-   local socket.
-3. Relay: `fake_watch.py` forwards the emulator's RFCOMM channel to that
-   socket and back.
+- `mac/` holds the Mac side, a small app bundle (`build.sh`, `run.sh`) so that
+  macOS grants Bluetooth to this tool only. Signed with the Apple Development
+  identity, so the permission survives rebuilds. Commands: `le-scan`,
+  `inquiry`, `paired`, `sdp`, `pair`, `bridge`.
+- Tested on the Mac (macOS 27.0.1, M1): Bluetooth permission granted, BLE
+  scan, classic inquiry and the paired list work from the app.
+- `fake_watch.py --relay PORT` hands the emulator's Wear OS channel to the Mac
+  helper over TCP. Tested with `tools/dummy_mac_helper.py`: the phone's first
+  108 bytes arrive on the Mac side. Without an answer the phone drops the
+  channel after about 15 seconds and pairs again.
+- Not tested yet, needs the watch: `pair`, `sdp` and `bridge` against the real
+  watch.
+
+## With the watch
+
+1. Watch on, in setup mode, next to the Mac.
+2. `mac/run.sh le-scan 20 --google`: note the watch's manufacturer data.
+3. `mac/run.sh inquiry 15`: look for the watch's classic address. If it does
+   not show up, the address has to come from elsewhere (CoreBluetooth hides
+   addresses).
+4. `mac/run.sh pair <address>`: the code is printed; compare with the watch.
+5. `mac/run.sh sdp <address>`: the Wear OS service
+   `5e8945b0952511e3a5e20800200c9a66` should be listed with an RFCOMM channel.
+6. `mac/run.sh bridge <address> 7700` (keep running).
+7. `.venv/bin/python fake_watch.py --relay 7700 --payload <data after e000>`.
+8. Emulator: Pixel Watch app, "Set up watch", pick the watch, "Pair". From
+   here the app talks to the real watch through the relay.
 
 Open questions: whether the watch accepts pairing from a Mac, and whether
 anything in the protocol is tied to Bluetooth addresses.
@@ -66,5 +86,6 @@ anything in the protocol is tied to Bluetooth addresses.
 - Emulator, in its own process group so it survives an interrupted shell:
   `emulator -avd pixelwatch_setup -no-audio -camera-back none -camera-front none -no-boot-anim -no-snapshot`.
   On the external PC keyboard AltGr+Q is ⌘Q and quits the emulator.
-- Fake watch: `.venv/bin/python fake_watch.py` (needs `bumble`, `grpcio`,
-  `protobuf`).
+- Fake watch: `.venv/bin/python fake_watch.py [--relay PORT]` (needs `bumble`,
+  `grpcio`, `protobuf`).
+- Mac helper: `zsh mac/build.sh`, then `zsh mac/run.sh <command>`.
