@@ -27,14 +27,39 @@ Google Pixel Watch app 5.1.0 (minSdk 30).
   force-stop `com.google.android.apps.wear.companion` and
   `com.android.companiondevicemanager`, then toggle Bluetooth.
 
+## Stage 2: classic Bluetooth and the Wear OS channel (2026-11-07)
+
+`fake_watch.py` is now dual-mode: LE advertising with the netsim public
+address, BR/EDR with Secure Simple Pairing (numeric comparison confirmed by
+the script), and an SDP record plus RFCOMM server for the Wear OS service.
+
+- The app bonds over BR/EDR. Android shows its normal numeric comparison
+  dialog (code 000000 under netsim); after "Pair" setup continues.
+- Then the phone's Wear OS stack (`WearableConn` in Play services) looks up
+  RFCOMM service `5E8945B0-9525-11E3-A5E2-0800200C9A66` via SDP and connects.
+  Without that record it retries every few seconds and the app stays on
+  "Connecting to your watch".
+- The phone is the RFCOMM client and speaks first: a 4-byte big-endian length
+  followed by a protobuf message (104 bytes in the first test). It carries a
+  node id, the phone's device name, the Android API level (35) and further
+  ids. Raw captures stay local in `captures/` (gitignored, they contain device
+  ids).
+- For the bridge this means: on the watch side the Mac only has to pair and
+  act as RFCOMM client (IOBluetooth `openRFCOMMChannel`); the relay can pass
+  bytes through without understanding them.
+
 ## Next
 
-1. When the watch is here: read its real advertisement, address and SDP
-   records from the Mac.
-2. Make the fake watch dual-mode with that data (LE advertising plus BR/EDR
-   with Secure Simple Pairing and mirrored SDP records).
-3. Relay RFCOMM/L2CAP between Bumble (emulator side) and IOBluetooth (watch
-   side).
+1. When the watch is here: find its BR/EDR address from the Mac (CoreBluetooth
+   hides addresses; try IOBluetooth inquiry, the setup screen name, or the
+   advertisement), pair with it via IOBluetooth and read its SDP records.
+2. Mac helper: open RFCOMM to the watch's Wear OS service and expose it on a
+   local socket.
+3. Relay: `fake_watch.py` forwards the emulator's RFCOMM channel to that
+   socket and back.
+
+Open questions: whether the watch accepts pairing from a Mac, and whether
+anything in the protocol is tied to Bluetooth addresses.
 
 ## Run
 
