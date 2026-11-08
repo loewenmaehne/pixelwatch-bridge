@@ -550,6 +550,7 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
     private var channelOpen = false
     private var channelID: BluetoothRFCOMMChannelID = 0
     private var sdpLink: SDPLink?
+    private var openTimer: Timer?
     private var notifications: [IOBluetoothUserNotification] = []
     private var flowRecord: IOBluetoothSDPServiceRecord?
     private var flowChannelID: BluetoothRFCOMMChannelID = 0
@@ -739,10 +740,22 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
             return
         }
         channel = opened
+        // macOS sometimes fails the connect at once (OI_RFCOMM_Connect status
+        // 911) without calling rfcommChannelOpenComplete; the session would
+        // then wait forever. Give up after 12 s so the next session retries.
+        openTimer?.invalidate()
+        openTimer = Timer.scheduledTimer(withTimeInterval: 12, repeats: false) { [weak self] _ in
+            guard let self, let channel = self.channel, channel === opened, !self.channelOpen else { return }
+            self.channel = nil
+            channel.setDelegate(nil)
+            channel.close()
+            self.endSession("RFCOMM open got no answer within 12 s")
+        }
     }
 
     func rfcommChannelOpenComplete(_ rfcommChannel: IOBluetoothRFCOMMChannel!, status error: IOReturn) {
         guard rfcommChannel === channel else { return }
+        openTimer?.invalidate()
         log("bridge: RFCOMM open status=\(error) mtu=\(rfcommChannel.getMTU())")
         guard error == kIOReturnSuccess else {
             channel = nil
@@ -926,6 +939,16 @@ case "services":
     let records = (target.services as? [IOBluetoothSDPServiceRecord]) ?? []
     log("services: \(records.count) cached, paired=\(target.isPaired())")
     records.forEach { log("services: \(describe($0))") }
+
+case "disconnect":
+    // Drops the baseband link (all channels) but keeps the pairing.
+    guard arguments.count >= 2, let target = device(for: arguments[1]) else {
+        log("usage: disconnect <address>")
+        exit(2)
+    }
+    log("disconnect: result=\(target.closeConnection())")
+    runLoop(timeout: 3)
+    log("disconnect: connected=\(target.isConnected())")
 
 case "unpair":
     // Private IOBluetooth API (also used by blueutil). Needed when the watch
