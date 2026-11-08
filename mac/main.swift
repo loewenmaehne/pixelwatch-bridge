@@ -300,6 +300,8 @@ final class SDPLink: NSObject, IOBluetoothL2CAPChannelDelegate {
     private var transaction: UInt16 = 0
     private var stopped = false
     private var found = false
+    private var inFlight: UnsafeMutableRawPointer?  // request being sent
+    private var inFlightSince = Date()
 
     init(device: IOBluetoothDevice) { self.device = device }
 
@@ -336,6 +338,11 @@ final class SDPLink: NSObject, IOBluetoothL2CAPChannelDelegate {
 
     private func query() {
         guard !stopped, let channel else { return }
+        // One request at a time; a completion lost for 5 s does not stop it.
+        if inFlight != nil && Date().timeIntervalSince(inFlightSince) < 5 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.query() }
+            return
+        }
         transaction &+= 1
         let pattern: [UInt8] = [0x35, 0x11, 0x1C] + wearServiceUUIDBytes
         let attributes: [UInt8] = [0x35, 0x03, 0x09, 0x00, 0x04]  // ProtocolDescriptorList
@@ -345,10 +352,25 @@ final class SDPLink: NSObject, IOBluetoothL2CAPChannelDelegate {
             UInt8(parameters.count >> 8), UInt8(parameters.count & 0xFF),
         ]
         pdu += parameters
-        let result = pdu.withUnsafeMutableBytes { buffer in
-            channel.writeSync(buffer.baseAddress, length: UInt16(buffer.count))
+        // writeSync blocks about 3 s here (see ChannelWriter), which held up
+        // the Wear channel's open callback until its timer gave up.
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: pdu.count, alignment: 1)
+        buffer.copyMemory(from: pdu, byteCount: pdu.count)
+        let result = channel.writeAsync(buffer, length: UInt16(pdu.count), refcon: nil)
+        if result == kIOReturnSuccess {
+            inFlight = buffer
+            inFlightSince = Date()
+        } else {
+            buffer.deallocate()
+            log("sdplink: request failed \(result)")
         }
-        if result != kIOReturnSuccess { log("sdplink: request failed \(result)") }
+    }
+
+    func l2capChannelWriteComplete(
+        _ l2capChannel: IOBluetoothL2CAPChannel!, refcon: UnsafeMutableRawPointer!, status error: IOReturn
+    ) {
+        inFlight?.deallocate()
+        inFlight = nil
     }
 
     func l2capChannelData(
@@ -725,6 +747,7 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
     private var session = 0
     private var pending = Data()  // phone -> watch, until the RFCOMM channel is open
     private var writer: ChannelWriter?
+    private var sessionStart = Date()
     private var channel: IOBluetoothRFCOMMChannel?
     private var channelOpen = false
     private var channelID: BluetoothRFCOMMChannelID = 0
@@ -792,6 +815,7 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         if client != nil { endSession("a new relay connection replaces it") }
         session += 1
         client = connection
+        sessionStart = Date()
         log("bridge: session \(session) starts")
         connection.start(queue: .main)
         receive(from: connection, session: session)
@@ -866,6 +890,18 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
 
     private func connectWatch() {
         guard client != nil, channel == nil else { return }
+        // Right after bonding the app drops its first connection within a few
+        // seconds and connects again. The watch's channel is opened only for a
+        // session that lasts, so that flap never reaches the watch.
+        let age = Date().timeIntervalSince(sessionStart)
+        if age < 5 {
+            let id = session
+            DispatchQueue.main.asyncAfter(deadline: .now() + (5 - age)) { [weak self] in
+                guard let self, self.session == id else { return }
+                self.connectWatch()
+            }
+            return
+        }
         guard watchReady else {
             holdWatch()
             return
@@ -882,12 +918,12 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         // 911) without calling rfcommChannelOpenComplete; the session would
         // then wait forever. Give up after 12 s so the next session retries.
         openTimer?.invalidate()
-        openTimer = Timer.scheduledTimer(withTimeInterval: 12, repeats: false) { [weak self] _ in
+        openTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in
             guard let self, let channel = self.channel, channel === opened, !self.channelOpen else { return }
             self.channel = nil
             channel.setDelegate(nil)
             channel.close()
-            self.endSession("RFCOMM open got no answer within 12 s")
+            self.endSession("RFCOMM open got no answer within 20 s")
         }
     }
 
