@@ -590,6 +590,36 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         holdWatch()
     }
 
+    /// Closes every channel and record this process holds. A bridge that just
+    /// exits leaves its proxy channel open in bluetoothd; that orphan took the
+    /// watch's data and every later RFCOMM connect failed (status 911) until
+    /// bluetoothd restarted.
+    func shutdown() {
+        log("bridge: shutting down")
+        proxyTimer?.invalidate()
+        proxyTimer = nil
+        proxyNotification?.unregister()
+        proxyNotification = nil
+        let relays = Array(proxies.values)
+        proxies.removeAll()
+        relays.forEach { $0.close() }
+        openTimer?.invalidate()
+        if let channel {
+            self.channel = nil
+            channel.setDelegate(nil)
+            channel.close()
+        }
+        channelOpen = false
+        sdpLink?.onClosed = nil
+        sdpLink?.close()
+        sdpLink = nil
+        client?.cancel()
+        client = nil
+        listener?.cancel()
+        flowRecord?.remove()
+        flowRecord = nil
+    }
+
     private func publishProxyService() {
         let service: [String: Any] = [
             "0001 - ServiceClassIDList": [Data(flowServiceUUIDBytes)],
@@ -976,8 +1006,22 @@ case "bridge":
     let bridge = Bridge(device: target, port: port)
     // Optional fourth argument: the watch's RFCOMM channel, if SDP cannot find it.
     if arguments.count >= 4, let channel = UInt8(arguments[3]) { bridge.useChannel(channel) }
+    // Stop cleanly on SIGTERM/SIGINT (pkill, Ctrl-C): close the channels first.
+    var stopping = false
+    let stopSources = [SIGTERM, SIGINT].map { number -> DispatchSourceSignal in
+        signal(number, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+        source.setEventHandler {
+            guard !stopping else { return }
+            stopping = true
+            bridge.shutdown()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(0) }
+        }
+        source.resume()
+        return source
+    }
     bridge.start()
-    runLoop(timeout: 86_400 * 365) { bridge.failed }
+    withExtendedLifetime(stopSources) { runLoop(timeout: 86_400 * 365) { bridge.failed } }
 
 default:
     print(
