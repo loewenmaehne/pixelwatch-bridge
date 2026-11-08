@@ -168,24 +168,9 @@ ready" start setup in the app and confirm the emulator's pairing; once the
 Wear OS channel is open, `proxy 7701 <fresh channel>`; if the data crawls,
 restart the bridge with the channel from the log.
 
-## Run with the watch
-
-1. Emulator with the Pixel Watch app on its first screen; `fake_watch.py
-   --relay 7700 --payload <payload with the fake address> --name <watch name>`
-   running.
-2. Watch factory reset (without a phone: Fastboot, see Google's Pixel Watch
-   troubleshooting page) and on the pairing screen.
-3. `tools/setup_run.sh`: waits for the watch's advertisement, removes a stale
-   pairing on the Mac, starts setup in the app, picks the watch, confirms the
-   emulator's pairing dialog and starts `mac/run.sh bridge <address> 7700 5`.
-4. Click Connect in the macOS pairing dialog. The rest runs through the bridge.
-5. Account step in the app: Sign in, screen lock, "Copy", screen lock.
-
 ## Run
 
-- Emulator, in its own process group so it survives an interrupted shell:
-  `emulator -avd pixelwatch_setup -no-audio -camera-back none -camera-front none -no-boot-anim -no-snapshot`.
-  On the external PC keyboard AltGr+Q is ⌘Q and quits the emulator.
-- Fake watch: `.venv/bin/python fake_watch.py [--relay PORT]` (needs `bumble`,
-  `grpcio`, `protobuf`).
-- Mac helper: `zsh mac/build.sh`, then `zsh mac/run.sh <command>`.
+Install and run steps are in `README.md`. `tools/setup_run.sh` follows the
+order above; `restart` restarts the bridge with the Wear OS channel given,
+`stop` stops bridge and proxy. Start the emulator in its own process group,
+so it survives an interrupted shell.
