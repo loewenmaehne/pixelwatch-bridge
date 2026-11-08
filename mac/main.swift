@@ -292,6 +292,7 @@ final class SDPLink: NSObject, IOBluetoothL2CAPChannelDelegate {
     private var channel: IOBluetoothL2CAPChannel?
     private var transaction: UInt16 = 0
     private var stopped = false
+    private var found = false
 
     init(device: IOBluetoothDevice) { self.device = device }
 
@@ -350,8 +351,14 @@ final class SDPLink: NSObject, IOBluetoothL2CAPChannelDelegate {
         guard !stopped else { return }
         let bytes = [UInt8](Data(bytes: dataPointer, count: dataLength))
         if let id = rfcommChannel(in: bytes) {
-            log("sdplink: Wear OS service on RFCOMM channel \(id) (query \(transaction))")
-            onChannel?(id)
+            if !found {
+                found = true
+                log("sdplink: Wear OS service on RFCOMM channel \(id) (query \(transaction))")
+                onChannel?(id)
+            }
+            // The watch closes an idle SDP connection after 30 s and then the
+            // link drops; asking again every 10 s keeps it until RFCOMM opens.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in self?.query() }
             return
         }
         if transaction == 1 || transaction % 10 == 0 {
