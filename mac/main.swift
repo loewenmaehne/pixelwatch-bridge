@@ -552,6 +552,9 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
     private var sdpLink: SDPLink?
     private var notifications: [IOBluetoothUserNotification] = []
     private var flowRecord: IOBluetoothSDPServiceRecord?
+    private var flowChannelID: BluetoothRFCOMMChannelID = 0
+    private var proxyNotification: IOBluetoothUserNotification?
+    private var proxyTimer: Timer?
     private var proxies: [Int: ProxyRelay] = [:]
     private var proxyCount = 0
     var failed = false
@@ -609,16 +612,31 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
             return
         }
         flowRecord = record
-        if let registration = IOBluetoothRFCOMMChannel.register(
-            forChannelOpenNotifications: self, selector: #selector(proxyChannelOpened(_:channel:)),
-            withChannelID: channelID, direction: kIOBluetoothUserNotificationChannelDirectionIncoming)
-        {
-            notifications.append(registration)
-        }
+        flowChannelID = channelID
         log("proxy: Flow15 service published on RFCOMM channel \(channelID)")
+        // bluetoothd matches an incoming RFCOMM connection only against apps
+        // that register *after* it arrived ("No sessions found saving incoming
+        // connection info", then "Found Incoming Connection channel" on the
+        // next registration). So the bridge registers again every second.
+        listenForProxyChannels()
+        proxyTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.listenForProxyChannels()
+        }
+    }
+
+    private func listenForProxyChannels() {
+        proxyNotification?.unregister()
+        proxyNotification = IOBluetoothRFCOMMChannel.register(
+            forChannelOpenNotifications: self, selector: #selector(proxyChannelOpened(_:channel:)),
+            withChannelID: flowChannelID, direction: kIOBluetoothUserNotificationChannelDirectionIncoming)
     }
 
     @objc func proxyChannelOpened(_ notification: IOBluetoothUserNotification, channel: IOBluetoothRFCOMMChannel) {
+        // Re-registering reports channels that are already open again. Only
+        // one DLC per server channel can exist, so one relay at a time.
+        guard channel.isIncoming(), channel.getID() == flowChannelID, channel.isOpen(),
+            proxies.isEmpty
+        else { return }
         proxyCount += 1
         let id = proxyCount
         log("proxy \(id): watch opened RFCOMM channel \(channel.getID())")
