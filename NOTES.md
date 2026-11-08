@@ -111,16 +111,62 @@ Findings, in the order they mattered:
   incoming connection info", then "Found Incoming Connection channel" on the
   next registration). The bridge registers again every second while no proxy
   channel is open.
-- Do not restart the bridge during setup. A proxy channel left open by a killed
-  bridge stays attached to bluetoothd, and its data ends up in the next
-  bridge's Wear OS channel, which garbles the stream to the phone. After such
-  runs macOS also refused every new RFCOMM connect to the watch at once
+- With the proxy inside the bridge, a restart during setup broke the run: a
+  proxy channel left open by a killed bridge stayed attached to bluetoothd and
+  its data ended up in the next bridge's Wear OS channel. After such runs macOS
+  also refused every new RFCOMM connect to the watch at once
   (`OI_RFCOMM_Connect` status 911, no callback); unpairing on the Mac and a
-  factory reset of the watch clear it. The bridge gives an RFCOMM open 12 s.
+  factory reset of the watch clear it. Since the proxy runs as its own process,
+  restarting the bridge alone works (see stage 5).
 - Setup steps seen in the app log: CDM discovery, pairing, watch connection,
   factory reset protection, Wi-Fi sync (fails: the emulator's network), Google
   accounts (FIDO direct transfer, needs the watch's internet), terms, digital
   warranty, GMS check-in (needs internet).
+
+## Stage 5: setup completed (2026-11-08/09)
+
+The first complete setup: the app reported setup status FINISHED and shows the
+watch connected, with its battery level. What it took:
+
+- Write completions: macOS 27 calls only
+  `rfcommChannelWriteComplete:refcon:status:bytesWritten:`, never the variant
+  without `bytesWritten`. Waiting for the old one made every write sit out the
+  5 s stall timer. The writer now listens to both, carries its buffer as
+  refcon and waits 0.1 s at most.
+- Main queue held for 9 s at a time: an L2CAP open of the SDP link that failed
+  or hung (the first open right after pairing fails with -536870212) completes
+  later inside IOBluetooth, which then runs `openL2CAPChannelSync` with a
+  nested run loop on the main queue (`instantiateChannel:findExisting:` →
+  `waitforChanneOpen`). Every callback waited about 9 s, the watch's data came
+  in 4 KB per 9 s and the app waited for "watch ready" forever. Found with
+  `sample <pid>`. With the channel given, `bridge <address> 7700 <channel>`
+  opens no SDP link; after that 1.2 MB came through in 9 s.
+- Stale pipe for incoming channels: bluetoothd keeps the data pipe of a closed
+  incoming channel registered ("Pipe 0x0019 is already registered in
+  registerSocketInternal", then "Failed to register a socket"). The watch's
+  next Flow15 connection on that channel opens and dies at once. `proxy 7701
+  <channel>` takes a fresh channel instead (13, 14, … until bluetoothd
+  restarts).
+- "No free data structures" (Stack.RFCOMM) comes from the proxy's registration
+  every second and stays until bluetoothd restarts. Runs still worked with it;
+  it was not the cause of the stalls.
+- Restarting the bridge in the middle of setup worked: the baseband link stayed
+  up, the phone reconnected within a second and the app went on where it
+  waited.
+- After an aborted setup Play services reconnects to the fake watch every
+  second. "Retry" on the app's "Can't connect" screen stops it and leads back
+  to "Set up watch".
+- Terms: the optional ones are 1 usage and diagnostic reports, 3 location and
+  5 watch backup; diagnostics is ticked by default. The app logs the choice
+  ("Accepted terms: 3, 5, 2", "Logging terms were accepted is: false").
+- Steps after the terms: warranty, orientation, band, decision point, Fitbit,
+  Spacetime, safety, screen lock, Pay, app install, exit.
+
+Order that worked: watch on its pairing screen; unpair on the Mac; `bridge
+<address> 7700` (macOS asks to pair, click Connect at once); after "bridge:
+ready" start setup in the app and confirm the emulator's pairing; once the
+Wear OS channel is open, `proxy 7701 <fresh channel>`; if the data crawls,
+restart the bridge with the channel from the log.
 
 ## Run with the watch
 
