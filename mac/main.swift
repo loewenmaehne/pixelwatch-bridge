@@ -428,6 +428,82 @@ final class Pairing: NSObject, IOBluetoothDevicePairDelegate {
     }
 }
 
+// MARK: - Writing to the watch
+//
+// IOBluetoothRFCOMMChannel.writeSync waits about 3 s per call on macOS 27 and
+// spins the run loop meanwhile, so the bridge took in one 4 KB chunk from the
+// watch per write: the watch's data sync crawled and the setup heartbeats
+// timed out. writeAsync with one write in flight keeps the main thread free.
+
+final class ChannelWriter {
+    private let channel: IOBluetoothRFCOMMChannel
+    private let name: String
+    private var queue: [Data] = []
+    private var inFlight: UnsafeMutableRawPointer?
+    private var retries = 0
+    private var stallTimer: Timer?
+
+    init(channel: IOBluetoothRFCOMMChannel, name: String) {
+        self.channel = channel
+        self.name = name
+    }
+
+    func write(_ data: Data) {
+        let mtu = max(Int(channel.getMTU()), 1)
+        var offset = 0
+        while offset < data.count {
+            queue.append(data.subdata(in: offset..<min(offset + mtu, data.count)))
+            offset += mtu
+        }
+        pump()
+    }
+
+    /// Call from the channel delegate's rfcommChannelWriteComplete.
+    func completed(status: IOReturn) {
+        stallTimer?.invalidate()
+        inFlight?.deallocate()
+        inFlight = nil
+        if status != kIOReturnSuccess { log("\(name): write to the watch failed \(status)") }
+        pump()
+    }
+
+    func cancel() {
+        stallTimer?.invalidate()
+        queue.removeAll()
+    }
+
+    private func pump() {
+        guard inFlight == nil, let chunk = queue.first else { return }
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: chunk.count, alignment: 1)
+        chunk.copyBytes(to: buffer.assumingMemoryBound(to: UInt8.self), count: chunk.count)
+        let result = channel.writeAsync(buffer, length: UInt16(chunk.count), refcon: nil)
+        if result == kIOReturnSuccess {
+            queue.removeFirst()
+            inFlight = buffer
+            retries = 0
+            // Never let one lost completion stop the stream.
+            stallTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { [weak self] _ in
+                guard let self, self.inFlight != nil else { return }
+                log("\(self.name): no write completion after 5 s, going on")
+                self.inFlight = nil  // the buffer may still be in use, so it is not freed
+                self.pump()
+            }
+            return
+        }
+        buffer.deallocate()
+        // macOS can report the channel open a moment before it takes writes.
+        if result == kIOReturnNotOpen && retries < 10 {
+            retries += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in self?.pump() }
+            return
+        }
+        log("\(name): write to the watch failed \(result), \(chunk.count) bytes dropped")
+        queue.removeFirst()
+        retries = 0
+        pump()
+    }
+}
+
 // MARK: - Proxy (watch -> phone)
 //
 // During setup the watch gets internet through the phone: the Pixel Watch app
@@ -495,17 +571,16 @@ final class ProxyRelay: NSObject, IOBluetoothRFCOMMChannelDelegate {
         }
     }
 
+    private lazy var writer = ChannelWriter(channel: channel, name: "proxy \(id)")
+
     private func writeToWatch(_ data: Data) {
-        let mtu = max(Int(channel.getMTU()), 1)
-        var offset = 0
-        while offset < data.count {
-            var chunk = data.subdata(in: offset..<min(offset + mtu, data.count))
-            let result = chunk.withUnsafeMutableBytes { buffer in
-                channel.writeSync(buffer.baseAddress, length: UInt16(buffer.count))
-            }
-            if result != kIOReturnSuccess { log("proxy \(id): write to the watch failed \(result)") }
-            offset += mtu
-        }
+        writer.write(data)
+    }
+
+    func rfcommChannelWriteComplete(
+        _ rfcommChannel: IOBluetoothRFCOMMChannel!, refcon: UnsafeMutableRawPointer!, status error: IOReturn
+    ) {
+        writer.completed(status: error)
     }
 
     func rfcommChannelData(
@@ -529,6 +604,7 @@ final class ProxyRelay: NSObject, IOBluetoothRFCOMMChannelDelegate {
     func close() {
         guard !closed else { return }
         closed = true
+        writer.cancel()
         log("proxy \(id): closed, \(bytesUp) bytes up, \(bytesDown) bytes down")
         channel.setDelegate(nil)
         channel.close()
@@ -648,6 +724,7 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
     private var client: NWConnection?
     private var session = 0
     private var pending = Data()  // phone -> watch, until the RFCOMM channel is open
+    private var writer: ChannelWriter?
     private var channel: IOBluetoothRFCOMMChannel?
     private var channelOpen = false
     private var channelID: BluetoothRFCOMMChannelID = 0
@@ -699,6 +776,8 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
             channel.close()
         }
         channelOpen = false
+        writer?.cancel()
+        writer = nil
         sdpLink?.onClosed = nil
         sdpLink?.close()
         sdpLink = nil
@@ -727,6 +806,8 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
             channel.close()
         }
         channelOpen = false
+        writer?.cancel()
+        writer = nil
         pending.removeAll()
         client?.cancel()
         client = nil
@@ -822,29 +903,19 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         channelOpen = true
         sdpLink?.close()  // the RFCOMM channel holds the link now
         sdpLink = nil
-        flushPending()
+        let writer = ChannelWriter(channel: rfcommChannel, name: "bridge")
+        self.writer = writer
+        if !pending.isEmpty {
+            writer.write(pending)
+            pending.removeAll()
+        }
     }
 
-    /// Sends what the phone wrote before the channel was open. macOS can
-    /// report the channel open a moment before writes are accepted
-    /// (kIOReturnNotOpen), so the first write is retried for up to 2 s.
-    private func flushPending(attempt: Int = 0) {
-        guard let channel, channelOpen, !pending.isEmpty else { return }
-        var first = pending.prefix(max(Int(channel.getMTU()), 1))
-        let result = first.withUnsafeMutableBytes { buffer in
-            channel.writeSync(buffer.baseAddress, length: UInt16(buffer.count))
-        }
-        if result == kIOReturnNotOpen && attempt < 10 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                self?.flushPending(attempt: attempt + 1)
-            }
-            return
-        }
-        if result != kIOReturnSuccess { log("bridge: write to the watch failed \(result)") }
-        let rest = pending.dropFirst(first.count)
-        pending.removeAll()
-        if attempt > 0 { log("bridge: pending data sent after \(attempt) retries") }
-        if !rest.isEmpty { writeToWatch(Data(rest)) }
+    func rfcommChannelWriteComplete(
+        _ rfcommChannel: IOBluetoothRFCOMMChannel!, refcon: UnsafeMutableRawPointer!, status error: IOReturn
+    ) {
+        guard rfcommChannel === channel else { return }
+        writer?.completed(status: error)
     }
 
     func rfcommChannelData(
@@ -861,25 +932,17 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         guard rfcommChannel === channel else { return }
         channel = nil
         channelOpen = false
+        writer?.cancel()
+        writer = nil
         endSession("the watch closed the RFCOMM channel")
     }
 
     private func writeToWatch(_ data: Data) {
-        // Keep the order: while older data waits in `pending`, queue behind it.
-        guard let channel, channelOpen, pending.isEmpty else {
+        guard channelOpen, let writer else {
             pending.append(data)
             return
         }
-        let mtu = max(Int(channel.getMTU()), 1)
-        var offset = 0
-        while offset < data.count {
-            var chunk = data.subdata(in: offset..<min(offset + mtu, data.count))
-            let result = chunk.withUnsafeMutableBytes { buffer in
-                channel.writeSync(buffer.baseAddress, length: UInt16(buffer.count))
-            }
-            if result != kIOReturnSuccess { log("bridge: write to the watch failed \(result)") }
-            offset += mtu
-        }
+        writer.write(data)
     }
 
     // MARK: Link events of the watch (diagnostics)
