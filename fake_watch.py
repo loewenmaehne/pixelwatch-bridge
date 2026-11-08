@@ -80,11 +80,24 @@ def make_rfcomm_handler(relay_port: int | None):
     return on_rfcomm_open
 
 
+async def close_dlc(dlc: rfcomm.DLC) -> None:
+    if dlc.state != rfcomm.DLC.State.CONNECTED:
+        return
+    say("relay: closing the phone's channel")
+    try:
+        await dlc.disconnect()
+    except Exception as error:  # the phone may close it at the same moment
+        say(f"relay: closing the phone's channel failed: {error!r}")
+
+
 async def relay(dlc: rfcomm.DLC, port: int, capture: Capture) -> None:
+    """One phone channel = one TCP session = one RFCOMM session to the watch.
+    Whichever side closes first, the other side is closed too."""
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
     except OSError as error:
         say(f"relay: Mac helper not reachable on port {port}: {error}")
+        await close_dlc(dlc)
         return
     say(f"relay: connected to the Mac helper on port {port}")
 
@@ -93,15 +106,26 @@ async def relay(dlc: rfcomm.DLC, port: int, capture: Capture) -> None:
         capture.write("p", data)
         writer.write(data)
 
+    def phone_closed() -> None:
+        say("relay: phone closed the channel, closing the Mac side")
+        writer.close()
+
+    dlc.on("close", phone_closed)
     dlc.sink = phone_to_watch  # queued phone data is flushed here
+    if dlc.state != rfcomm.DLC.State.CONNECTED:
+        writer.close()
     try:
         while data := await reader.read(65536):
             say(f"relay: watch -> phone {len(data)} bytes {data[:24].hex()}")
             capture.write("w", data)
-            dlc.write(data)
+            if dlc.state == rfcomm.DLC.State.CONNECTED:
+                dlc.write(data)
+    except ConnectionError as error:
+        say(f"relay: Mac side error {error!r}")
     finally:
-        say("relay: Mac helper closed the connection")
         writer.close()
+        say("relay: Mac side closed")
+        await close_dlc(dlc)
 
 
 class AutoConfirm(PairingDelegate):
@@ -144,7 +168,7 @@ async def main(args: argparse.Namespace) -> None:
     config = DeviceConfiguration(
         name=args.name,
         address=Address(STATIC_ADDRESS),
-        class_of_device=CLASS_OF_DEVICE,
+        class_of_device=int(args.class_of_device, 16),
         classic_enabled=True,
         le_enabled=True,
         le_simultaneous_enabled=True,
@@ -201,6 +225,9 @@ if __name__ == "__main__":
     parser.add_argument("--relay", type=int, help="TCP port of the Mac helper")
     parser.add_argument("--payload", default=DEFAULT_PAYLOAD, help="manufacturer data hex")
     parser.add_argument("--name", default=DEFAULT_NAME)
+    parser.add_argument(
+        "--class-of-device", default=f"{CLASS_OF_DEVICE:06x}", help="hex, from the watch"
+    )
     parser.add_argument("--verbose", action="store_true", help="Bumble debug logs")
     arguments = parser.parse_args()
     logging.basicConfig(
