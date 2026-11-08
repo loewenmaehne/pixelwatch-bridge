@@ -180,8 +180,8 @@ async def proxy_session(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             raise RuntimeError("the phone is not connected")
         # The app registers the service anew when setup restarts, so the
         # channel can change; look it up for every channel.
-        phone.flow_channel = await rfcomm.find_rfcomm_channel_with_uuid(
-            phone.connection, FLOW_RFCOMM_UUID
+        phone.flow_channel = await asyncio.wait_for(
+            rfcomm.find_rfcomm_channel_with_uuid(phone.connection, FLOW_RFCOMM_UUID), 10
         )
         say(f"proxy: phone's Flow15 service on RFCOMM channel {phone.flow_channel}")
         if phone.flow_channel is None:
@@ -257,7 +257,15 @@ def on_connection(connection) -> None:
         "connection_encryption_change",
         lambda *args: say(f"encryption: {connection.is_encrypted}"),
     )
-    connection.on("disconnection", lambda reason: say(f"disconnected: {reason}"))
+    def disconnected(reason) -> None:
+        say(f"disconnected: {reason}")
+        # A proxy channel must never use a dead connection: the SDP lookup on
+        # it never returns and the watch's internet hangs.
+        if phone.connection is connection:
+            phone.connection = None
+            phone.multiplexer = None
+
+    connection.on("disconnection", disconnected)
 
 
 async def main(args: argparse.Namespace) -> None:
