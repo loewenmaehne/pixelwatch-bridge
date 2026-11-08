@@ -537,6 +537,108 @@ final class ProxyRelay: NSObject, IOBluetoothRFCOMMChannelDelegate {
     }
 }
 
+// MARK: - Proxy server
+//
+// Runs as its own process (`proxy` command). bluetoothd tells the process that
+// takes an incoming channel that the device connected, and IOBluetooth then
+// sends every outgoing RFCOMM open of that process again; those fail with
+// status 911 and took the bridge's Wear channel down whenever the watch opened
+// the proxy. In a separate process the Wear channel never sees that.
+
+final class ProxyServer: NSObject {
+    private let port: UInt16  // fake_watch.py's proxy listener (relay port + 1)
+    private var flowRecord: IOBluetoothSDPServiceRecord?
+    private var flowChannelID: BluetoothRFCOMMChannelID = 0
+    private var notification: IOBluetoothUserNotification?
+    private var timer: Timer?
+    private var proxies: [Int: ProxyRelay] = [:]
+    private var count = 0
+    var failed = false
+
+    init(port: UInt16) {
+        self.port = port
+    }
+
+    func start() {
+        publish()
+    }
+
+    func shutdown() {
+        log("proxy: shutting down")
+        timer?.invalidate()
+        timer = nil
+        notification?.unregister()
+        notification = nil
+        let relays = Array(proxies.values)
+        proxies.removeAll()
+        relays.forEach { $0.close() }
+        flowRecord?.remove()
+        flowRecord = nil
+    }
+
+    private func publish() {
+        let service: [String: Any] = [
+            "0001 - ServiceClassIDList": [Data(flowServiceUUIDBytes)],
+            "0004 - ProtocolDescriptorList": [
+                [Data([0x01, 0x00])],  // L2CAP
+                [
+                    Data([0x00, 0x03]),  // RFCOMM
+                    ["DataElementSize": 1, "DataElementType": 1, "DataElementValue": 12],
+                ],
+            ],
+            "0005 - BrowseGroupList*": [Data([0x10, 0x02])],
+            "0100 - ServiceName*": "Flow15",
+        ]
+        guard let record = IOBluetoothSDPServiceRecord.publishedServiceRecord(with: service) else {
+            log("proxy: publishing the Flow15 service failed")
+            failed = true
+            return
+        }
+        var channelID: BluetoothRFCOMMChannelID = 0
+        guard record.getRFCOMMChannelID(&channelID) == kIOReturnSuccess else {
+            log("proxy: published record has no RFCOMM channel")
+            failed = true
+            return
+        }
+        flowRecord = record
+        flowChannelID = channelID
+        log("proxy: Flow15 service published on RFCOMM channel \(channelID)")
+        // bluetoothd matches an incoming RFCOMM connection only against apps
+        // that register *after* it arrived ("No sessions found saving incoming
+        // connection info", then "Found Incoming Connection channel" on the
+        // next registration). So the proxy registers again every second.
+        listen()
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.listen()
+        }
+    }
+
+    private func listen() {
+        // While a proxy channel is open, registering again only makes
+        // bluetoothd attach the open channel to this session once more.
+        guard proxies.isEmpty else { return }
+        notification?.unregister()
+        notification = IOBluetoothRFCOMMChannel.register(
+            forChannelOpenNotifications: self, selector: #selector(channelOpened(_:channel:)),
+            withChannelID: flowChannelID, direction: kIOBluetoothUserNotificationChannelDirectionIncoming)
+    }
+
+    @objc func channelOpened(_ note: IOBluetoothUserNotification, channel: IOBluetoothRFCOMMChannel) {
+        // Re-registering reports channels that are already open again. Only
+        // one DLC per server channel can exist, so one relay at a time.
+        guard channel.isIncoming(), channel.getID() == flowChannelID, channel.isOpen(),
+            proxies.isEmpty
+        else { return }
+        count += 1
+        let id = count
+        log("proxy \(id): watch opened RFCOMM channel \(channel.getID())")
+        let relay = ProxyRelay(channel: channel, port: port, id: id)
+        relay.onClose = { [weak self] in self?.proxies[id] = nil }
+        proxies[id] = relay
+        relay.start()
+    }
+}
+
 // MARK: - Bridge
 
 final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
@@ -552,12 +654,6 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
     private var sdpLink: SDPLink?
     private var openTimer: Timer?
     private var notifications: [IOBluetoothUserNotification] = []
-    private var flowRecord: IOBluetoothSDPServiceRecord?
-    private var flowChannelID: BluetoothRFCOMMChannelID = 0
-    private var proxyNotification: IOBluetoothUserNotification?
-    private var proxyTimer: Timer?
-    private var proxies: [Int: ProxyRelay] = [:]
-    private var proxyCount = 0
     var failed = false
 
     init(device: IOBluetoothDevice, port: UInt16) {
@@ -585,27 +681,17 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         listener.start(queue: .main)
         self.listener = listener
         watchLinkEvents()
-        // The Flow15 service is published once the Wear channel is open: an
-        // incoming channel from the watch while the outgoing one is still
-        // opening makes macOS send the open again (status 911) and the bridge
-        // never gets the working channel.
+        // The Flow15 proxy runs in its own process (`proxy` command), see
+        // ProxyServer for why.
         log("bridge: watch paired=\(device.isPaired()), waiting for the relay on port \(port)")
         holdWatch()
     }
 
-    /// Closes every channel and record this process holds. A bridge that just
-    /// exits leaves its proxy channel open in bluetoothd; that orphan took the
-    /// watch's data and every later RFCOMM connect failed (status 911) until
-    /// bluetoothd restarted.
+    /// Closes every channel this process holds. A bridge that just exits leaves
+    /// its channels open in bluetoothd; such an orphan took the watch's data and
+    /// every later RFCOMM connect failed (status 911) until bluetoothd restarted.
     func shutdown() {
         log("bridge: shutting down")
-        proxyTimer?.invalidate()
-        proxyTimer = nil
-        proxyNotification?.unregister()
-        proxyNotification = nil
-        let relays = Array(proxies.values)
-        proxies.removeAll()
-        relays.forEach { $0.close() }
         openTimer?.invalidate()
         if let channel {
             self.channel = nil
@@ -619,68 +705,6 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         client?.cancel()
         client = nil
         listener?.cancel()
-        flowRecord?.remove()
-        flowRecord = nil
-    }
-
-    private func publishProxyService() {
-        let service: [String: Any] = [
-            "0001 - ServiceClassIDList": [Data(flowServiceUUIDBytes)],
-            "0004 - ProtocolDescriptorList": [
-                [Data([0x01, 0x00])],  // L2CAP
-                [
-                    Data([0x00, 0x03]),  // RFCOMM
-                    ["DataElementSize": 1, "DataElementType": 1, "DataElementValue": 12],
-                ],
-            ],
-            "0005 - BrowseGroupList*": [Data([0x10, 0x02])],
-            "0100 - ServiceName*": "Flow15",
-        ]
-        guard let record = IOBluetoothSDPServiceRecord.publishedServiceRecord(with: service) else {
-            log("proxy: publishing the Flow15 service failed")
-            return
-        }
-        var channelID: BluetoothRFCOMMChannelID = 0
-        guard record.getRFCOMMChannelID(&channelID) == kIOReturnSuccess else {
-            log("proxy: published record has no RFCOMM channel")
-            return
-        }
-        flowRecord = record
-        flowChannelID = channelID
-        log("proxy: Flow15 service published on RFCOMM channel \(channelID)")
-        // bluetoothd matches an incoming RFCOMM connection only against apps
-        // that register *after* it arrived ("No sessions found saving incoming
-        // connection info", then "Found Incoming Connection channel" on the
-        // next registration). So the bridge registers again every second.
-        listenForProxyChannels()
-        proxyTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            self?.listenForProxyChannels()
-        }
-    }
-
-    private func listenForProxyChannels() {
-        // While a proxy channel is open, registering again only makes
-        // bluetoothd attach the open channel to this session once more.
-        guard proxies.isEmpty else { return }
-        proxyNotification?.unregister()
-        proxyNotification = IOBluetoothRFCOMMChannel.register(
-            forChannelOpenNotifications: self, selector: #selector(proxyChannelOpened(_:channel:)),
-            withChannelID: flowChannelID, direction: kIOBluetoothUserNotificationChannelDirectionIncoming)
-    }
-
-    @objc func proxyChannelOpened(_ notification: IOBluetoothUserNotification, channel: IOBluetoothRFCOMMChannel) {
-        // Re-registering reports channels that are already open again. Only
-        // one DLC per server channel can exist, so one relay at a time.
-        guard channel.isIncoming(), channel.getID() == flowChannelID, channel.isOpen(),
-            proxies.isEmpty
-        else { return }
-        proxyCount += 1
-        let id = proxyCount
-        log("proxy \(id): watch opened RFCOMM channel \(channel.getID())")
-        let relay = ProxyRelay(channel: channel, port: port + 1, id: id)
-        relay.onClose = { [weak self] in self?.proxies[id] = nil }
-        proxies[id] = relay
-        relay.start()
     }
 
     // MARK: Sessions
@@ -798,7 +822,6 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         channelOpen = true
         sdpLink?.close()  // the RFCOMM channel holds the link now
         sdpLink = nil
-        if flowRecord == nil { publishProxyService() }
         flushPending()
     }
 
@@ -904,6 +927,24 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
 }
 
 // MARK: - Main
+
+/// Stops on SIGTERM/SIGINT (pkill, Ctrl-C) after `shutdown` closed the
+/// channels; keep the returned sources alive while running.
+func stopCleanly(_ shutdown: @escaping () -> Void) -> [DispatchSourceSignal] {
+    var stopping = false
+    return [SIGTERM, SIGINT].map { number in
+        signal(number, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+        source.setEventHandler {
+            guard !stopping else { return }
+            stopping = true
+            shutdown()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(0) }
+        }
+        source.resume()
+        return source
+    }
+}
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 let command = arguments.first ?? "help"
@@ -1023,34 +1064,33 @@ case "bridge":
     guard arguments.count >= 3, let target = device(for: arguments[1]),
         let port = UInt16(arguments[2])
     else {
-        log("usage: bridge <address> <port>")
+        log("usage: bridge <address> <port> [channel]")
         exit(2)
     }
     let bridge = Bridge(device: target, port: port)
     // Optional fourth argument: the watch's RFCOMM channel, if SDP cannot find it.
     if arguments.count >= 4, let channel = UInt8(arguments[3]) { bridge.useChannel(channel) }
-    // Stop cleanly on SIGTERM/SIGINT (pkill, Ctrl-C): close the channels first.
-    var stopping = false
-    let stopSources = [SIGTERM, SIGINT].map { number -> DispatchSourceSignal in
-        signal(number, SIG_IGN)
-        let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
-        source.setEventHandler {
-            guard !stopping else { return }
-            stopping = true
-            bridge.shutdown()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(0) }
-        }
-        source.resume()
-        return source
-    }
+    let stops = stopCleanly { bridge.shutdown() }
     bridge.start()
-    withExtendedLifetime(stopSources) { runLoop(timeout: 86_400 * 365) { bridge.failed } }
+    withExtendedLifetime(stops) { runLoop(timeout: 86_400 * 365) { bridge.failed } }
+
+case "proxy":
+    // proxy <port>: Flow15 for the watch, handed to fake_watch.py on <port>
+    // (the bridge's relay port + 1). Runs beside `bridge`, never inside it.
+    guard arguments.count >= 2, let port = UInt16(arguments[1]) else {
+        log("usage: proxy <port>")
+        exit(2)
+    }
+    let server = ProxyServer(port: port)
+    let stops = stopCleanly { server.shutdown() }
+    server.start()
+    withExtendedLifetime(stops) { runLoop(timeout: 86_400 * 365) { server.failed } }
 
 default:
     print(
         """
         usage: PixelWatchBridge le-scan [seconds] [--google] | watch-scan [seconds]
                | inquiry [seconds] [--le|--both] | paired | sdp <address> | pair <address>
-               | unpair <address> | bridge <address> <port>
+               | unpair <address> | bridge <address> <port> [channel] | proxy <port>
         """)
 }
