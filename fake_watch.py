@@ -178,11 +178,12 @@ async def proxy_session(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     try:
         if phone.connection is None or phone.multiplexer is None:
             raise RuntimeError("the phone is not connected")
-        if phone.flow_channel is None:
-            phone.flow_channel = await rfcomm.find_rfcomm_channel_with_uuid(
-                phone.connection, FLOW_RFCOMM_UUID
-            )
-            say(f"proxy: phone's Flow15 service on RFCOMM channel {phone.flow_channel}")
+        # The app registers the service anew when setup restarts, so the
+        # channel can change; look it up for every channel.
+        phone.flow_channel = await rfcomm.find_rfcomm_channel_with_uuid(
+            phone.connection, FLOW_RFCOMM_UUID
+        )
+        say(f"proxy: phone's Flow15 service on RFCOMM channel {phone.flow_channel}")
         if phone.flow_channel is None:
             raise RuntimeError("the phone offers no Flow15 service")
         dlc = await open_dlc_to_phone(phone.multiplexer, phone.flow_channel)

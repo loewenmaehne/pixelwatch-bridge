@@ -625,6 +625,9 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
     }
 
     private func listenForProxyChannels() {
+        // While a proxy channel is open, registering again only makes
+        // bluetoothd attach the open channel to this session once more.
+        guard proxies.isEmpty else { return }
         proxyNotification?.unregister()
         proxyNotification = IOBluetoothRFCOMMChannel.register(
             forChannelOpenNotifications: self, selector: #selector(proxyChannelOpened(_:channel:)),
