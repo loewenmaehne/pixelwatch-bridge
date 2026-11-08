@@ -6,7 +6,7 @@ set -euo pipefail
 
 DIR="${0:A:h}"
 APP="$DIR/build/PixelWatchBridge.app"
-LOG="${PIXELWATCH_BRIDGE_LOG:-$DIR/build/last-run.log}"
+LOG="${PIXELWATCH_BRIDGE_LOG:-$DIR/build/${1:-help}.log}"
 
 : > "$LOG"
 open -W -n --stdout "$LOG" --stderr "$LOG" "$APP" --args "$@"
