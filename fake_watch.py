@@ -43,7 +43,23 @@ CAPTURE_DIR = pathlib.Path(__file__).with_name("captures")
 # RFCOMM service the phone's Wear OS stack connects to on the watch
 # (seen in the emulator log: btsock_rfc_connect service_uuid=...).
 WEAR_RFCOMM_UUID = UUID("5E8945B0-9525-11E3-A5E2-0800200C9A66")
+# The phone's internet proxy for the watch ("Flow15"), offered by the Pixel
+# Watch app while setup runs. The watch connects to it, so this direction is
+# watch -> phone: the Mac helper accepts the watch's channel and hands it to
+# us over TCP (relay port + 1), and we open the channel to the phone.
+FLOW_RFCOMM_UUID = UUID("6A1EAFB1-61C0-42A0-8BB0-A336FB1C3F00")
 SDP_HANDLE = 0x00010001
+
+
+class Phone:
+    """The emulator's link to this fake watch, kept for the proxy direction."""
+
+    connection = None  # BR/EDR ACL connection
+    multiplexer = None  # RFCOMM session the phone opened
+    flow_channel = None  # RFCOMM channel of the phone's Flow15 service
+
+
+phone = Phone()
 
 
 def say(message: str) -> None:
@@ -128,6 +144,84 @@ async def relay(dlc: rfcomm.DLC, port: int, capture: Capture) -> None:
         await close_dlc(dlc)
 
 
+async def open_dlc_to_phone(multiplexer: rfcomm.Multiplexer, channel: int) -> rfcomm.DLC:
+    """Opens a DLC to a server channel of the phone over the phone's own RFCOMM
+    session. Bumble's open_dlc assumes the server sits on the responder side
+    (even DLCI); the phone is the initiator here, so its channels use odd DLCIs.
+    A second RFCOMM session (rfcomm.Client) would collide with the phone's."""
+    if multiplexer.state != rfcomm.Multiplexer.State.CONNECTED:
+        raise RuntimeError(f"phone RFCOMM session not ready ({multiplexer})")
+    responder = multiplexer.role == rfcomm.Multiplexer.Role.RESPONDER
+    multiplexer.open_pn = rfcomm.RFCOMM_MCC_PN(
+        dlci=(channel << 1) | (1 if responder else 0),
+        cl=0xF0,
+        priority=7,
+        ack_timer=0,
+        max_frame_size=rfcomm.RFCOMM_DEFAULT_MAX_FRAME_SIZE,
+        max_retransmissions=0,
+        initial_credits=rfcomm.RFCOMM_DEFAULT_INITIAL_CREDITS,
+    )
+    mcc = rfcomm.RFCOMM_Frame.make_mcc(
+        mcc_type=rfcomm.MccType.PN, c_r=1, data=bytes(multiplexer.open_pn)
+    )
+    multiplexer.open_result = asyncio.get_running_loop().create_future()
+    multiplexer.change_state(rfcomm.Multiplexer.State.OPENING)
+    multiplexer.send_frame(
+        rfcomm.RFCOMM_Frame.uih(c_r=0 if responder else 1, dlci=0, information=mcc)
+    )
+    return await asyncio.wait_for(multiplexer.open_result, timeout=10)
+
+
+async def proxy_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """One channel the watch opened to the phone's proxy, handed over by the Mac."""
+    say("proxy: the watch opened a channel to the phone's proxy")
+    try:
+        if phone.connection is None or phone.multiplexer is None:
+            raise RuntimeError("the phone is not connected")
+        if phone.flow_channel is None:
+            phone.flow_channel = await rfcomm.find_rfcomm_channel_with_uuid(
+                phone.connection, FLOW_RFCOMM_UUID
+            )
+            say(f"proxy: phone's Flow15 service on RFCOMM channel {phone.flow_channel}")
+        if phone.flow_channel is None:
+            raise RuntimeError("the phone offers no Flow15 service")
+        dlc = await open_dlc_to_phone(phone.multiplexer, phone.flow_channel)
+    except Exception as error:
+        say(f"proxy: cannot reach the phone's proxy: {error!r}")
+        phone.flow_channel = None  # look it up again next time
+        writer.close()
+        return
+    say(f"proxy: open to the phone ({dlc})")
+    counts = {"up": 0, "down": 0}
+
+    def phone_to_watch(data: bytes) -> None:
+        counts["down"] += len(data)
+        writer.write(data)
+
+    def phone_closed() -> None:
+        say("proxy: the phone closed the channel")
+        writer.close()
+
+    dlc.sink = phone_to_watch
+    dlc.on("close", phone_closed)
+    try:
+        while data := await reader.read(65536):
+            counts["up"] += len(data)
+            if dlc.state == rfcomm.DLC.State.CONNECTED:
+                dlc.write(data)
+    except ConnectionError as error:
+        say(f"proxy: Mac side error {error!r}")
+    finally:
+        writer.close()
+        say(f"proxy: closed, {counts['up']} bytes up, {counts['down']} bytes down")
+        await close_dlc(dlc)
+
+
+def remember_multiplexer(multiplexer: rfcomm.Multiplexer) -> None:
+    phone.multiplexer = multiplexer
+    say("rfcomm: phone started an RFCOMM session")
+
+
 class AutoConfirm(PairingDelegate):
     """Accepts every pairing and prints the code the app should show."""
 
@@ -154,6 +248,8 @@ class AutoConfirm(PairingDelegate):
 
 def on_connection(connection) -> None:
     say(f"connected: {connection.peer_address} transport={connection.transport.name}")
+    if connection.transport.name == "BR_EDR":
+        phone.connection = connection
     connection.on("pairing", lambda keys: say("pairing: done"))
     connection.on("pairing_failure", lambda reason: say(f"pairing: failed {reason}"))
     connection.on(
@@ -182,7 +278,11 @@ async def main(args: argparse.Namespace) -> None:
         )
         device.on("connection", on_connection)
         rfcomm_server = rfcomm.Server(device)
+        rfcomm_server.on(rfcomm_server.EVENT_START, remember_multiplexer)
         channel = rfcomm_server.listen(make_rfcomm_handler(args.relay))
+        if args.relay:
+            await asyncio.start_server(proxy_session, "127.0.0.1", args.relay + 1)
+            say(f"proxy: waiting for the Mac helper on port {args.relay + 1}")
         device.sdp_service_records = {
             SDP_HANDLE: rfcomm.make_service_sdp_records(
                 SDP_HANDLE, channel, WEAR_RFCOMM_UUID

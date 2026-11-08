@@ -54,6 +54,13 @@ func device(for address: String) -> IOBluetoothDevice? {
     IOBluetoothDevice(addressString: address.replacingOccurrences(of: ":", with: "-"))
 }
 
+// The phone's internet proxy for the watch ("Flow15", RFCOMM), offered by the
+// Pixel Watch app while setup is active.
+let flowServiceUUIDBytes: [UInt8] = [
+    0x6A, 0x1E, 0xAF, 0xB1, 0x61, 0xC0, 0x42, 0xA0,
+    0x8B, 0xB0, 0xA3, 0x36, 0xFB, 0x1C, 0x3F, 0x00,
+]
+
 func wearServiceUUID() -> IOBluetoothSDPUUID {
     wearServiceUUIDBytes.withUnsafeBytes { buffer in
         IOBluetoothSDPUUID(bytes: buffer.baseAddress, length: 16)
@@ -421,6 +428,115 @@ final class Pairing: NSObject, IOBluetoothDevicePairDelegate {
     }
 }
 
+// MARK: - Proxy (watch -> phone)
+//
+// During setup the watch gets internet through the phone: the Pixel Watch app
+// offers the RFCOMM service "Flow15" and the watch connects to it on the
+// device it is paired with, which is the Mac. So the bridge publishes the same
+// service and hands every channel the watch opens to fake_watch.py over TCP,
+// which opens the matching channel to the emulator.
+
+final class ProxyRelay: NSObject, IOBluetoothRFCOMMChannelDelegate {
+    private let channel: IOBluetoothRFCOMMChannel
+    private let connection: NWConnection
+    private let id: Int
+    private var toPhone = Data()  // until the TCP connection is ready
+    private var tcpReady = false
+    private var closed = false
+    private var bytesUp = 0
+    private var bytesDown = 0
+    var onClose: (() -> Void)?
+
+    init(channel: IOBluetoothRFCOMMChannel, port: UInt16, id: Int) {
+        self.channel = channel
+        self.id = id
+        connection = NWConnection(
+            host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+        super.init()
+    }
+
+    func start() {
+        channel.setDelegate(self)
+        connection.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                log("proxy \(self.id): handed to fake_watch")
+                self.tcpReady = true
+                if !self.toPhone.isEmpty {
+                    self.connection.send(content: self.toPhone, completion: .contentProcessed { _ in })
+                    self.toPhone.removeAll()
+                }
+                self.receive()
+            case .failed(let error):
+                log("proxy \(self.id): fake_watch not reachable \(error)")
+                self.close()
+            default:
+                break
+            }
+        }
+        connection.start(queue: .main)
+    }
+
+    private func receive() {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) {
+            [weak self] data, _, isComplete, error in
+            guard let self, !self.closed else { return }
+            if let data, !data.isEmpty {
+                self.bytesDown += data.count
+                self.writeToWatch(data)
+            }
+            if isComplete || error != nil {
+                log("proxy \(self.id): phone side closed")
+                self.close()
+                return
+            }
+            self.receive()
+        }
+    }
+
+    private func writeToWatch(_ data: Data) {
+        let mtu = max(Int(channel.getMTU()), 1)
+        var offset = 0
+        while offset < data.count {
+            var chunk = data.subdata(in: offset..<min(offset + mtu, data.count))
+            let result = chunk.withUnsafeMutableBytes { buffer in
+                channel.writeSync(buffer.baseAddress, length: UInt16(buffer.count))
+            }
+            if result != kIOReturnSuccess { log("proxy \(id): write to the watch failed \(result)") }
+            offset += mtu
+        }
+    }
+
+    func rfcommChannelData(
+        _ rfcommChannel: IOBluetoothRFCOMMChannel!, data dataPointer: UnsafeMutableRawPointer!,
+        length dataLength: Int
+    ) {
+        let data = Data(bytes: dataPointer, count: dataLength)
+        bytesUp += data.count
+        if tcpReady {
+            connection.send(content: data, completion: .contentProcessed { _ in })
+        } else {
+            toPhone.append(data)
+        }
+    }
+
+    func rfcommChannelClosed(_ rfcommChannel: IOBluetoothRFCOMMChannel!) {
+        log("proxy \(id): watch closed the channel")
+        close()
+    }
+
+    func close() {
+        guard !closed else { return }
+        closed = true
+        log("proxy \(id): closed, \(bytesUp) bytes up, \(bytesDown) bytes down")
+        channel.setDelegate(nil)
+        channel.close()
+        connection.cancel()
+        onClose?()
+    }
+}
+
 // MARK: - Bridge
 
 final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
@@ -435,6 +551,9 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
     private var channelID: BluetoothRFCOMMChannelID = 0
     private var sdpLink: SDPLink?
     private var notifications: [IOBluetoothUserNotification] = []
+    private var flowRecord: IOBluetoothSDPServiceRecord?
+    private var proxies: [Int: ProxyRelay] = [:]
+    private var proxyCount = 0
     var failed = false
 
     init(device: IOBluetoothDevice, port: UInt16) {
@@ -462,8 +581,51 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         listener.start(queue: .main)
         self.listener = listener
         watchLinkEvents()
+        publishProxyService()
         log("bridge: watch paired=\(device.isPaired()), waiting for the relay on port \(port)")
         holdWatch()
+    }
+
+    private func publishProxyService() {
+        let service: [String: Any] = [
+            "0001 - ServiceClassIDList": [Data(flowServiceUUIDBytes)],
+            "0004 - ProtocolDescriptorList": [
+                [Data([0x01, 0x00])],  // L2CAP
+                [
+                    Data([0x00, 0x03]),  // RFCOMM
+                    ["DataElementSize": 1, "DataElementType": 1, "DataElementValue": 12],
+                ],
+            ],
+            "0005 - BrowseGroupList*": [Data([0x10, 0x02])],
+            "0100 - ServiceName*": "Flow15",
+        ]
+        guard let record = IOBluetoothSDPServiceRecord.publishedServiceRecord(with: service) else {
+            log("proxy: publishing the Flow15 service failed")
+            return
+        }
+        var channelID: BluetoothRFCOMMChannelID = 0
+        guard record.getRFCOMMChannelID(&channelID) == kIOReturnSuccess else {
+            log("proxy: published record has no RFCOMM channel")
+            return
+        }
+        flowRecord = record
+        if let registration = IOBluetoothRFCOMMChannel.register(
+            forChannelOpenNotifications: self, selector: #selector(proxyChannelOpened(_:channel:)),
+            withChannelID: channelID, direction: kIOBluetoothUserNotificationChannelDirectionIncoming)
+        {
+            notifications.append(registration)
+        }
+        log("proxy: Flow15 service published on RFCOMM channel \(channelID)")
+    }
+
+    @objc func proxyChannelOpened(_ notification: IOBluetoothUserNotification, channel: IOBluetoothRFCOMMChannel) {
+        proxyCount += 1
+        let id = proxyCount
+        log("proxy \(id): watch opened RFCOMM channel \(channel.getID())")
+        let relay = ProxyRelay(channel: channel, port: port + 1, id: id)
+        relay.onClose = { [weak self] in self?.proxies[id] = nil }
+        proxies[id] = relay
+        relay.start()
     }
 
     // MARK: Sessions
