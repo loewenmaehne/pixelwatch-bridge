@@ -678,6 +678,7 @@ final class ProxyRelay: NSObject, IOBluetoothRFCOMMChannelDelegate {
 
 final class ProxyServer: NSObject {
     private let port: UInt16  // fake_watch.py's proxy listener (relay port + 1)
+    private let channel: BluetoothRFCOMMChannelID
     private var flowRecord: IOBluetoothSDPServiceRecord?
     private var flowChannelID: BluetoothRFCOMMChannelID = 0
     private var notification: IOBluetoothUserNotification?
@@ -686,8 +687,13 @@ final class ProxyServer: NSObject {
     private var count = 0
     var failed = false
 
-    init(port: UInt16) {
+    /// bluetoothd keeps the data pipe of an incoming channel registered after
+    /// it closed ("Pipe 0x0019 is already registered"), so every later
+    /// connection on the same channel fails until bluetoothd restarts. A fresh
+    /// channel number avoids that.
+    init(port: UInt16, channel: BluetoothRFCOMMChannelID) {
         self.port = port
+        self.channel = channel
     }
 
     func start() {
@@ -714,7 +720,7 @@ final class ProxyServer: NSObject {
                 [Data([0x01, 0x00])],  // L2CAP
                 [
                     Data([0x00, 0x03]),  // RFCOMM
-                    ["DataElementSize": 1, "DataElementType": 1, "DataElementValue": 12],
+                    ["DataElementSize": 1, "DataElementType": 1, "DataElementValue": Int(channel)],
                 ],
             ],
             "0005 - BrowseGroupList*": [Data([0x10, 0x02])],
@@ -1220,13 +1226,16 @@ case "bridge":
     withExtendedLifetime(stops) { runLoop(timeout: 86_400 * 365) { bridge.failed } }
 
 case "proxy":
-    // proxy <port>: Flow15 for the watch, handed to fake_watch.py on <port>
-    // (the bridge's relay port + 1). Runs beside `bridge`, never inside it.
+    // proxy <port> [channel]: Flow15 for the watch on RFCOMM <channel>
+    // (default 12; take an unused one after a run, see ProxyServer), handed
+    // to fake_watch.py on <port> (the bridge's relay port + 1). Runs beside
+    // `bridge`, never inside it.
     guard arguments.count >= 2, let port = UInt16(arguments[1]) else {
-        log("usage: proxy <port>")
+        log("usage: proxy <port> [channel]")
         exit(2)
     }
-    let server = ProxyServer(port: port)
+    let channel = arguments.dropFirst(2).first.flatMap(UInt8.init) ?? 12
+    let server = ProxyServer(port: port, channel: channel)
     let stops = stopCleanly { server.shutdown() }
     server.start()
     withExtendedLifetime(stops) { runLoop(timeout: 86_400 * 365) { server.failed } }
@@ -1236,6 +1245,6 @@ default:
         """
         usage: PixelWatchBridge le-scan [seconds] [--google] | watch-scan [seconds]
                | inquiry [seconds] [--le|--both] | paired | sdp <address> | pair <address>
-               | unpair <address> | bridge <address> <port> [channel] | proxy <port>
+               | unpair <address> | bridge <address> <port> [channel] | proxy <port> [channel]
         """)
 }
