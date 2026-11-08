@@ -8,6 +8,7 @@
 //   paired                           list devices paired with this Mac
 //   sdp <address>                    list SDP services of a device
 //   pair <address>                   pair (numeric comparison is confirmed, the code is printed)
+//   unpair <address>                 remove the pairing from this Mac
 //   bridge <address> <port>          relay the watch's Wear OS RFCOMM service to TCP clients on
 //                                    127.0.0.1:<port>. Each client gets its own RFCOMM session;
 //                                    pairing and the SDP lookup happen when the first one connects.
@@ -252,9 +253,124 @@ final class SDPQuery: NSObject {
 
     func start() -> IOReturn { device.performSDPQuery(self) }
 
+    // Asks the device for these services; the plain query may only return
+    // what macOS cached at pairing time, without custom services.
+    func start(uuids: [IOBluetoothSDPUUID]) -> IOReturn { device.performSDPQuery(self, uuids: uuids) }
+
     @objc func sdpQueryComplete(_ device: IOBluetoothDevice!, status: IOReturn) {
         let onComplete = onComplete
         DispatchQueue.main.async { onComplete(status) }  // the owner may release us
+    }
+}
+
+// MARK: - SDP link
+//
+// macOS answers IOBluetooth SDP queries from its cache, which holds only the
+// profiles it searched for at pairing time (Handsfree, A2DP, AVRCP), not the
+// Wear OS service. So the bridge asks the watch's SDP server itself over
+// L2CAP PSM 1: a ServiceSearchAttribute request for the Wear OS UUID, reading
+// the RFCOMM channel from the ProtocolDescriptorList. The open channel also
+// holds the link to the watch, and the query repeats every second until the
+// service shows up (the watch publishes it a few seconds after pairing).
+
+func rfcommChannel(in bytes: [UInt8]) -> BluetoothRFCOMMChannelID? {
+    guard bytes.count >= 5 else { return nil }
+    // ... 19 00 03 08 <channel>: UUID16 RFCOMM followed by a uint8 channel
+    for index in 0...(bytes.count - 5)
+    where bytes[index] == 0x19 && bytes[index + 1] == 0x00 && bytes[index + 2] == 0x03
+        && bytes[index + 3] == 0x08
+    {
+        return bytes[index + 4]
+    }
+    return nil
+}
+
+final class SDPLink: NSObject, IOBluetoothL2CAPChannelDelegate {
+    private let device: IOBluetoothDevice
+    var onChannel: ((BluetoothRFCOMMChannelID) -> Void)?
+    var onClosed: (() -> Void)?
+    private var channel: IOBluetoothL2CAPChannel?
+    private var transaction: UInt16 = 0
+    private var stopped = false
+
+    init(device: IOBluetoothDevice) { self.device = device }
+
+    func open() -> IOReturn {
+        var opened: IOBluetoothL2CAPChannel?
+        let result = device.openL2CAPChannelAsync(&opened, withPSM: 0x0001, delegate: self)
+        channel = opened
+        log("sdplink: opening L2CAP to the watch's SDP server result=\(result)")
+        return result
+    }
+
+    func close() {
+        guard !stopped else { return }
+        stopped = true
+        log("sdplink: closing")
+        if let channel {
+            self.channel = nil
+            channel.setDelegate(nil)
+            channel.close()
+        }
+    }
+
+    func l2capChannelOpenComplete(_ l2capChannel: IOBluetoothL2CAPChannel!, status error: IOReturn) {
+        guard !stopped else { return }
+        guard error == kIOReturnSuccess else {
+            log("sdplink: open failed \(error)")
+            channel = nil
+            notifyClosed()
+            return
+        }
+        log("sdplink: open, paired=\(device.isPaired())")
+        query()
+    }
+
+    private func query() {
+        guard !stopped, let channel else { return }
+        transaction &+= 1
+        let pattern: [UInt8] = [0x35, 0x11, 0x1C] + wearServiceUUIDBytes
+        let attributes: [UInt8] = [0x35, 0x03, 0x09, 0x00, 0x04]  // ProtocolDescriptorList
+        let parameters = pattern + [0x04, 0x00] + attributes + [0x00]
+        var pdu: [UInt8] = [
+            0x06, UInt8(transaction >> 8), UInt8(transaction & 0xFF),
+            UInt8(parameters.count >> 8), UInt8(parameters.count & 0xFF),
+        ]
+        pdu += parameters
+        let result = pdu.withUnsafeMutableBytes { buffer in
+            channel.writeSync(buffer.baseAddress, length: UInt16(buffer.count))
+        }
+        if result != kIOReturnSuccess { log("sdplink: request failed \(result)") }
+    }
+
+    func l2capChannelData(
+        _ l2capChannel: IOBluetoothL2CAPChannel!, data dataPointer: UnsafeMutableRawPointer!,
+        length dataLength: Int
+    ) {
+        guard !stopped else { return }
+        let bytes = [UInt8](Data(bytes: dataPointer, count: dataLength))
+        if let id = rfcommChannel(in: bytes) {
+            log("sdplink: Wear OS service on RFCOMM channel \(id) (query \(transaction))")
+            onChannel?(id)
+            return
+        }
+        if transaction == 1 || transaction % 10 == 0 {
+            log("sdplink: Wear OS service not published yet (query \(transaction), \(hex(Data(bytes), limit: 24)))")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.query() }
+    }
+
+    func l2capChannelClosed(_ l2capChannel: IOBluetoothL2CAPChannel!) {
+        guard !stopped else { return }
+        log("sdplink: closed")
+        channel = nil
+        notifyClosed()
+    }
+
+    private func notifyClosed() {
+        stopped = true
+        let onClosed = onClosed
+        DispatchQueue.main.async { onClosed?() }  // the owner may release us
     }
 }
 
@@ -310,14 +426,18 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
     private var channel: IOBluetoothRFCOMMChannel?
     private var channelOpen = false
     private var channelID: BluetoothRFCOMMChannelID = 0
-    private var pairing: Pairing?
-    private var sdp: SDPQuery?
+    private var sdpLink: SDPLink?
     private var notifications: [IOBluetoothUserNotification] = []
     var failed = false
 
     init(device: IOBluetoothDevice, port: UInt16) {
         self.device = device
         self.port = port
+    }
+
+    func useChannel(_ channel: BluetoothRFCOMMChannelID) {
+        channelID = channel
+        log("bridge: using RFCOMM channel \(channel) as given")
     }
 
     func start() {
@@ -336,6 +456,7 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         self.listener = listener
         watchLinkEvents()
         log("bridge: watch paired=\(device.isPaired()), waiting for the relay on port \(port)")
+        holdWatch()
     }
 
     // MARK: Sessions
@@ -361,6 +482,7 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         pending.removeAll()
         client?.cancel()
         client = nil
+        holdWatch()
     }
 
     private func receive(from connection: NWConnection, session id: Int) {
@@ -379,33 +501,44 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         }
     }
 
-    // MARK: Watch side: pairing, SDP, RFCOMM
+    // MARK: Watch side
+    //
+    // In setup mode the watch takes new connections only until it is paired
+    // and publishes the Wear OS service a few seconds after pairing. A phone
+    // keeps the link from pairing and connects over it, and so does the
+    // bridge: the SDP link is opened while the watch is still unpaired, macOS
+    // then pairs on its own and shows its dialog (apps cannot confirm pairing
+    // themselves, IOBluetoothDevicePair times out), the link stays open and
+    // asks for the service every second, and the RFCOMM channel is opened over
+    // the same link once the service appears and a phone session is waiting.
+
+    private var watchReady: Bool { channelID != 0 && device.isPaired() }
+
+    private func holdWatch() {
+        guard sdpLink == nil, channel == nil else { return }
+        let link = SDPLink(device: device)
+        link.onChannel = { [weak self] id in
+            guard let self else { return }
+            self.channelID = id
+            log("bridge: ready, paired=\(self.device.isPaired()), session waiting=\(self.client != nil)")
+            self.connectWatch()
+        }
+        link.onClosed = { [weak self] in
+            guard let self else { return }
+            self.sdpLink = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.holdWatch() }
+        }
+        guard link.open() == kIOReturnSuccess else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.holdWatch() }
+            return
+        }
+        sdpLink = link
+    }
 
     private func connectWatch() {
         guard client != nil, channel == nil else { return }
-        if !device.isPaired() {
-            guard pairing == nil else { return }
-            log("bridge: not paired yet, pairing now (confirm on the watch if it asks)")
-            let pairing = Pairing { [weak self] succeeded in
-                guard let self else { return }
-                self.pairing = nil
-                if succeeded {
-                    self.connectWatch()
-                } else if self.client != nil {
-                    self.endSession("pairing failed")
-                }
-            }
-            let result = pairing.start(device: device)
-            log("bridge: pairing start result=\(result)")
-            if result == kIOReturnSuccess { self.pairing = pairing } else { endSession("pairing did not start") }
-            return
-        }
-        if channelID == 0 {
-            guard sdp == nil else { return }
-            let query = SDPQuery(device: device) { [weak self] status in self?.sdpFinished(status) }
-            let result = query.start()
-            log("bridge: SDP query result=\(result)")
-            if result == kIOReturnSuccess { sdp = query } else { endSession("SDP query did not start") }
+        guard watchReady else {
+            holdWatch()
             return
         }
         var opened: IOBluetoothRFCOMMChannel?
@@ -418,35 +551,17 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         channel = opened
     }
 
-    private func sdpFinished(_ status: IOReturn) {
-        sdp = nil
-        let records = (device.services as? [IOBluetoothSDPServiceRecord]) ?? []
-        log("bridge: SDP status=\(status), \(records.count) services")
-        guard let record = records.first(where: { $0.matchesUUIDArray([wearServiceUUID()]) }) else {
-            records.forEach { log("bridge: service \($0.getServiceName() ?? "-")") }
-            if client != nil { endSession("Wear OS service not found") }
-            return
-        }
-        var id: BluetoothRFCOMMChannelID = 0
-        guard record.getRFCOMMChannelID(&id) == kIOReturnSuccess else {
-            if client != nil { endSession("Wear OS service has no RFCOMM channel") }
-            return
-        }
-        channelID = id
-        log("bridge: Wear OS service on RFCOMM channel \(id)")
-        connectWatch()
-    }
-
     func rfcommChannelOpenComplete(_ rfcommChannel: IOBluetoothRFCOMMChannel!, status error: IOReturn) {
         guard rfcommChannel === channel else { return }
         log("bridge: RFCOMM open status=\(error) mtu=\(rfcommChannel.getMTU())")
         guard error == kIOReturnSuccess else {
             channel = nil
-            channelID = 0  // look the channel up again next time
             endSession("RFCOMM open failed")
             return
         }
         channelOpen = true
+        sdpLink?.close()  // the RFCOMM channel holds the link now
+        sdpLink = nil
         if !pending.isEmpty {
             let data = pending
             pending.removeAll()
@@ -599,6 +714,45 @@ case "pair":
     runLoop(timeout: 90) { outcome != nil }
     exit(outcome == true ? 0 : 1)
 
+case "sdp-raw":
+    guard arguments.count >= 2, let target = device(for: arguments[1]) else {
+        log("usage: sdp-raw <address>")
+        exit(2)
+    }
+    var done = false
+    let link = SDPLink(device: target)
+    link.onChannel = { _ in done = true }
+    link.onClosed = { done = true }
+    _ = link.open()
+    runLoop(timeout: 30) { done }
+    link.close()
+
+case "services":
+    // What macOS has cached for the device, without asking it again.
+    guard arguments.count >= 2, let target = device(for: arguments[1]) else {
+        log("usage: services <address>")
+        exit(2)
+    }
+    let records = (target.services as? [IOBluetoothSDPServiceRecord]) ?? []
+    log("services: \(records.count) cached, paired=\(target.isPaired())")
+    records.forEach { log("services: \(describe($0))") }
+
+case "unpair":
+    // Private IOBluetooth API (also used by blueutil). Needed when the watch
+    // went back to setup and forgot the pairing while the Mac kept it.
+    guard arguments.count >= 2, let target = device(for: arguments[1]) else {
+        log("usage: unpair <address>")
+        exit(2)
+    }
+    let remove = Selector(("remove"))
+    guard target.responds(to: remove) else {
+        log("unpair: not supported on this macOS")
+        exit(1)
+    }
+    target.perform(remove)
+    runLoop(timeout: 2)
+    log("unpair: done, paired=\(target.isPaired())")
+
 case "bridge":
     guard arguments.count >= 3, let target = device(for: arguments[1]),
         let port = UInt16(arguments[2])
@@ -607,6 +761,8 @@ case "bridge":
         exit(2)
     }
     let bridge = Bridge(device: target, port: port)
+    // Optional fourth argument: the watch's RFCOMM channel, if SDP cannot find it.
+    if arguments.count >= 4, let channel = UInt8(arguments[3]) { bridge.useChannel(channel) }
     bridge.start()
     runLoop(timeout: 86_400 * 365) { bridge.failed }
 
@@ -615,6 +771,6 @@ default:
         """
         usage: PixelWatchBridge le-scan [seconds] [--google] | watch-scan [seconds]
                | inquiry [seconds] [--le|--both] | paired | sdp <address> | pair <address>
-               | bridge <address> <port>
+               | unpair <address> | bridge <address> <port>
         """)
 }
