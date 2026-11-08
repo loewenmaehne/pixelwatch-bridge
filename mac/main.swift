@@ -800,9 +800,16 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         self.port = port
     }
 
+    /// With the channel given the bridge opens no SDP link at all. A pending
+    /// L2CAP open that macOS 27 completes after the link was closed sends
+    /// IOBluetooth into openL2CAPChannelSync with a nested run loop on the main
+    /// queue; that held every callback for about 9 s, again and again.
+    private var channelGiven = false
+
     func useChannel(_ channel: BluetoothRFCOMMChannelID) {
         channelID = channel
-        log("bridge: using RFCOMM channel \(channel) as given")
+        channelGiven = true
+        log("bridge: using RFCOMM channel \(channel) as given, no SDP link")
     }
 
     func start() {
@@ -907,7 +914,7 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
     private var watchReady: Bool { channelID != 0 && device.isPaired() }
 
     private func holdWatch() {
-        guard sdpLink == nil, channel == nil else { return }
+        guard !channelGiven, sdpLink == nil, channel == nil else { return }
         let link = SDPLink(device: device)
         link.onChannel = { [weak self] id in
             guard let self else { return }
