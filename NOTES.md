@@ -63,23 +63,77 @@ the script), and an SDP record plus RFCOMM server for the Wear OS service.
 - Not tested yet, needs the watch: `pair`, `sdp` and `bridge` against the real
   watch.
 
-## With the watch
+## Stage 4: the real watch (2026-11-08)
 
-1. Watch on, in setup mode, next to the Mac.
-2. `mac/run.sh le-scan 20 --google`: note the watch's manufacturer data.
-3. `mac/run.sh inquiry 15`: look for the watch's classic address. If it does
-   not show up, the address has to come from elsewhere (CoreBluetooth hides
-   addresses).
-4. `mac/run.sh pair <address>`: the code is printed; compare with the watch.
-5. `mac/run.sh sdp <address>`: the Wear OS service
-   `5e8945b0952511e3a5e20800200c9a66` should be listed with an RFCOMM channel.
-6. `mac/run.sh bridge <address> 7700` (keep running).
-7. `.venv/bin/python fake_watch.py --relay 7700 --payload <data after e000>`.
-8. Emulator: Pixel Watch app, "Set up watch", pick the watch, "Pair". From
-   here the app talks to the real watch through the relay.
+Tested with a Pixel Watch 4 in setup mode, emulator Play services 26.43.
 
-Open questions: whether the watch accepts pairing from a Mac, and whether
-anything in the protocol is tied to Bluetooth addresses.
+What works through the bridge: pairing, the Wear OS channel, the setup screens
+up to the Google account, terms, warranty and GMS check-in, and the watch's
+internet access through the phone.
+
+Findings, in the order they mattered:
+
+- Advertisement: manufacturer data (Google) of 17 bytes. Bytes 10 to 15 after
+  the company id hold the watch's BR/EDR address, which is also its public
+  advertising address. `watch-scan` prints it. The app bonds with the
+  advertising address of the device it picked, so `fake_watch.py` gets the
+  payload with its own netsim address in those six bytes.
+- Discovery: classic inquiry finds nothing (the watch is not discoverable) and
+  `IOBluetoothDeviceInquiry` delivers no results at all on this macOS. The
+  address comes from the advertisement instead.
+- Pairing: macOS ignores pairing confirmations from apps without Apple's
+  programmatic-pairing entitlement; `IOBluetoothDevicePair` times out after
+  30 s (error 31). When bluetoothd starts the pairing itself, after an app
+  connects to an unpaired device, it shows its own dialog with the code the
+  watch displays, and the user confirms on the Mac. The watch only shows the
+  code. So the bridge never pairs; it opens a connection and the user clicks
+  Connect.
+- After pairing the watch takes no new connections. The link from pairing has
+  to stay up until the Wear OS channel is open, as on a phone. The watch
+  publishes the Wear OS service 2 to 3 s after pairing (RFCOMM channel 5 in
+  every run), and its SDP server closes an idle connection after 30 s.
+- SDP: IOBluetooth queries are answered from macOS's cache, which holds only
+  the profiles macOS looked for (Handsfree, A2DP, AVRCP), and the completion
+  callback often never arrives. The bridge asks the watch's SDP server itself
+  over L2CAP PSM 1 (`SDPLink`), keeps that channel open as the link holder and
+  repeats the query every 10 s until the RFCOMM channel is open.
+- Internet: during setup the watch reaches the internet through the phone. The
+  Pixel Watch app offers an RFCOMM service "Flow15"
+  (`6a1eafb1-61c0-42a0-8bb0-a336fb1c3f00`, plus an LE L2CAP channel) and the
+  watch connects to it on the device it is paired with, the Mac. Without it the
+  account copy fails with "Remote device error" (10760) and setup stops at GMS
+  check-in ("factory reset required"). The bridge publishes Flow15 on the Mac,
+  hands every channel the watch opens to `fake_watch.py` (TCP, relay port + 1),
+  which opens a channel to the phone's Flow15 over the phone's own RFCOMM
+  session (odd DLCI, since the phone is the initiator there).
+- Incoming RFCOMM on macOS: bluetoothd matches an incoming connection only
+  against sessions that register *after* it arrived ("No sessions found saving
+  incoming connection info", then "Found Incoming Connection channel" on the
+  next registration). The bridge registers again every second while no proxy
+  channel is open.
+- Do not restart the bridge during setup. A proxy channel left open by a killed
+  bridge stays attached to bluetoothd, and its data ends up in the next
+  bridge's Wear OS channel, which garbles the stream to the phone. After such
+  runs macOS also refused every new RFCOMM connect to the watch at once
+  (`OI_RFCOMM_Connect` status 911, no callback); unpairing on the Mac and a
+  factory reset of the watch clear it. The bridge gives an RFCOMM open 12 s.
+- Setup steps seen in the app log: CDM discovery, pairing, watch connection,
+  factory reset protection, Wi-Fi sync (fails: the emulator's network), Google
+  accounts (FIDO direct transfer, needs the watch's internet), terms, digital
+  warranty, GMS check-in (needs internet).
+
+## Run with the watch
+
+1. Emulator with the Pixel Watch app on its first screen; `fake_watch.py
+   --relay 7700 --payload <payload with the fake address> --name <watch name>`
+   running.
+2. Watch factory reset (without a phone: Fastboot, see Google's Pixel Watch
+   troubleshooting page) and on the pairing screen.
+3. `tools/setup_run.sh`: waits for the watch's advertisement, removes a stale
+   pairing on the Mac, starts setup in the app, picks the watch, confirms the
+   emulator's pairing dialog and starts `mac/run.sh bridge <address> 7700 5`.
+4. Click Connect in the macOS pairing dialog. The rest runs through the bridge.
+5. Account step in the app: Sign in, screen lock, "Copy", screen lock.
 
 ## Run
 
