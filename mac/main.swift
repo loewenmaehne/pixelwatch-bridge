@@ -585,7 +585,10 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         listener.start(queue: .main)
         self.listener = listener
         watchLinkEvents()
-        publishProxyService()
+        // The Flow15 service is published once the Wear channel is open: an
+        // incoming channel from the watch while the outgoing one is still
+        // opening makes macOS send the open again (status 911) and the bridge
+        // never gets the working channel.
         log("bridge: watch paired=\(device.isPaired()), waiting for the relay on port \(port)")
         holdWatch()
     }
@@ -795,11 +798,30 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         channelOpen = true
         sdpLink?.close()  // the RFCOMM channel holds the link now
         sdpLink = nil
-        if !pending.isEmpty {
-            let data = pending
-            pending.removeAll()
-            writeToWatch(data)
+        if flowRecord == nil { publishProxyService() }
+        flushPending()
+    }
+
+    /// Sends what the phone wrote before the channel was open. macOS can
+    /// report the channel open a moment before writes are accepted
+    /// (kIOReturnNotOpen), so the first write is retried for up to 2 s.
+    private func flushPending(attempt: Int = 0) {
+        guard let channel, channelOpen, !pending.isEmpty else { return }
+        var first = pending.prefix(max(Int(channel.getMTU()), 1))
+        let result = first.withUnsafeMutableBytes { buffer in
+            channel.writeSync(buffer.baseAddress, length: UInt16(buffer.count))
         }
+        if result == kIOReturnNotOpen && attempt < 10 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.flushPending(attempt: attempt + 1)
+            }
+            return
+        }
+        if result != kIOReturnSuccess { log("bridge: write to the watch failed \(result)") }
+        let rest = pending.dropFirst(first.count)
+        pending.removeAll()
+        if attempt > 0 { log("bridge: pending data sent after \(attempt) retries") }
+        if !rest.isEmpty { writeToWatch(Data(rest)) }
     }
 
     func rfcommChannelData(
@@ -820,7 +842,8 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
     }
 
     private func writeToWatch(_ data: Data) {
-        guard let channel, channelOpen else {
+        // Keep the order: while older data waits in `pending`, queue behind it.
+        guard let channel, channelOpen, pending.isEmpty else {
             pending.append(data)
             return
         }
