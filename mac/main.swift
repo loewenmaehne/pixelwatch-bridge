@@ -480,12 +480,28 @@ final class ChannelWriter {
         pump()
     }
 
-    /// Call from the channel delegate's rfcommChannelWriteComplete.
-    func completed(status: IOReturn) {
+    private var stalls = 0
+    private var completions = 0
+    private var busy = 0
+
+    /// Call from both rfcommChannelWriteComplete variants of the delegate.
+    /// macOS 27 never sent the old variant (refcon:status:) during a setup run,
+    /// so every write waited out the stall timer and the stream crawled.
+    func completed(refcon: UnsafeMutableRawPointer?, status: IOReturn, variant: String) {
+        completions += 1
+        if completions == 1 { log("\(name): first write completion (\(variant))") }
+        // A late completion of a write the stall timer already gave up on.
+        guard let refcon, refcon == inFlight else { return }
         stallTimer?.invalidate()
-        inFlight?.deallocate()
+        refcon.deallocate()
         inFlight = nil
         if status != kIOReturnSuccess { log("\(name): write to the watch failed \(status)") }
+        pump()
+    }
+
+    /// Call from rfcommChannelQueueSpaceAvailable.
+    func spaceAvailable() {
+        guard inFlight == nil else { return }
         pump()
     }
 
@@ -498,25 +514,31 @@ final class ChannelWriter {
         guard inFlight == nil, let chunk = queue.first else { return }
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: chunk.count, alignment: 1)
         chunk.copyBytes(to: buffer.assumingMemoryBound(to: UInt8.self), count: chunk.count)
-        let result = channel.writeAsync(buffer, length: UInt16(chunk.count), refcon: nil)
+        let result = channel.writeAsync(buffer, length: UInt16(chunk.count), refcon: buffer)
         if result == kIOReturnSuccess {
             queue.removeFirst()
             inFlight = buffer
             retries = 0
-            // Never let one lost completion stop the stream.
-            stallTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { [weak self] _ in
-                guard let self, self.inFlight != nil else { return }
-                log("\(self.name): no write completion after 5 s, going on")
+            // Never let a lost completion hold the stream: wait 0.1 s at most.
+            stallTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: false) { [weak self] _ in
+                guard let self, self.inFlight == buffer else { return }
+                self.stalls += 1
+                if self.stalls == 1 || self.stalls % 200 == 0 {
+                    log("\(self.name): \(self.stalls) writes without completion, going on after 0.1 s")
+                }
                 self.inFlight = nil  // the buffer may still be in use, so it is not freed
                 self.pump()
             }
             return
         }
         buffer.deallocate()
-        // macOS can report the channel open a moment before it takes writes.
-        if result == kIOReturnNotOpen && retries < 10 {
+        // macOS can report the channel open a moment before it takes writes,
+        // and refuses writes while its buffer for the channel is full.
+        if retries < 100 {
             retries += 1
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in self?.pump() }
+            busy += 1
+            if busy == 1 || busy % 200 == 0 { log("\(name): write returned \(result) (\(busy)x), retrying") }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in self?.pump() }
             return
         }
         log("\(name): write to the watch failed \(result), \(chunk.count) bytes dropped")
@@ -602,7 +624,18 @@ final class ProxyRelay: NSObject, IOBluetoothRFCOMMChannelDelegate {
     func rfcommChannelWriteComplete(
         _ rfcommChannel: IOBluetoothRFCOMMChannel!, refcon: UnsafeMutableRawPointer!, status error: IOReturn
     ) {
-        writer.completed(status: error)
+        writer.completed(refcon: refcon, status: error, variant: "status")
+    }
+
+    func rfcommChannelWriteComplete(
+        _ rfcommChannel: IOBluetoothRFCOMMChannel!, refcon: UnsafeMutableRawPointer!, status error: IOReturn,
+        bytesWritten length: Int
+    ) {
+        writer.completed(refcon: refcon, status: error, variant: "bytesWritten")
+    }
+
+    func rfcommChannelQueueSpaceAvailable(_ rfcommChannel: IOBluetoothRFCOMMChannel!) {
+        writer.spaceAvailable()
     }
 
     func rfcommChannelData(
@@ -951,7 +984,20 @@ final class Bridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         _ rfcommChannel: IOBluetoothRFCOMMChannel!, refcon: UnsafeMutableRawPointer!, status error: IOReturn
     ) {
         guard rfcommChannel === channel else { return }
-        writer?.completed(status: error)
+        writer?.completed(refcon: refcon, status: error, variant: "status")
+    }
+
+    func rfcommChannelWriteComplete(
+        _ rfcommChannel: IOBluetoothRFCOMMChannel!, refcon: UnsafeMutableRawPointer!, status error: IOReturn,
+        bytesWritten length: Int
+    ) {
+        guard rfcommChannel === channel else { return }
+        writer?.completed(refcon: refcon, status: error, variant: "bytesWritten")
+    }
+
+    func rfcommChannelQueueSpaceAvailable(_ rfcommChannel: IOBluetoothRFCOMMChannel!) {
+        guard rfcommChannel === channel else { return }
+        writer?.spaceAvailable()
     }
 
     func rfcommChannelData(
