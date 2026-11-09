@@ -148,6 +148,8 @@ This worked in the middle of setup: the link to the watch stayed up, the emulato
 
 This is an independent project, not affiliated with, endorsed or supported by Google. Pixel, Pixel Watch, Wear OS, Android and Google Play are trademarks of Google LLC. Mac and macOS are trademarks of Apple Inc.
 
+The Android emulator is part of the Android SDK, which Google licenses for developing apps for Android (Android Software Development Kit License Agreement, section 3). Check that your use fits those terms.
+
 ## No support
 
 The code is shared as is, for anyone stuck in the same spot. There is no support, and issues and pull requests may go unanswered.
