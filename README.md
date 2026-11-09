@@ -151,3 +151,7 @@ This is an independent project, not affiliated with, endorsed or supported by Go
 ## No support
 
 The code is shared as is, for anyone stuck in the same spot. There is no support, and issues and pull requests may go unanswered.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
